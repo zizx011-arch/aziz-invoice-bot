@@ -1,304 +1,485 @@
 
 import os
 import re
-import logging
-import hashlib
-from io import BytesIO
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from io import BytesIO
 
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TZ = ZoneInfo("Africa/Lusaka")
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-
-# Tall, mobile-readable portrait invoice
-W = 1400
-M = 70
-NAVY = "#14243A"
-GOLD = "#E2BD69"
-CREAM = "#FAF7EF"
+# ألوان التصميم
+NAVY = "#102F5E"
+NAVY_LIGHT = "#194778"
+GOLD = "#F4C45E"
 WHITE = "#FFFFFF"
-INK = "#1D2C40"
-GREY = "#657286"
-PALE = "#F3E9D2"
+BG = "#FCFAF5"
+BLUE_PALE = "#E7F2FC"
+TEXT = "#102F5E"
+GREEN = "#087B68"
+BORDER = "#3D91D8"
+
+# أبعاد الصورة: نسبة قريبة من A4 بالطول
+W = 1400
+MARGIN = 48
 
 
-def font(size, bold=False):
-    names = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        if bold else
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
-        if bold else
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-    ]
-    for name in names:
-        if os.path.exists(name):
-            return ImageFont.truetype(name, size)
+def load_font(size, bold=False):
+    candidates = (
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        ]
+        if bold
+        else [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ]
+    )
+
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+
     return ImageFont.load_default()
 
 
-def clean_amount(value):
-    return value.strip().replace("٬", "").replace(",", "").replace(" ", "")
+def fit_font(draw, text, max_width, size, bold=True, min_size=18):
+    while size > min_size:
+        f = load_font(size, bold)
+        if draw.textbbox((0, 0), text, font=f)[2] <= max_width:
+            return f
+        size -= 2
+    return load_font(min_size, bold)
 
 
-def show_amount(value):
-    try:
-        n = float(clean_amount(value))
-        return f"{int(n):,}" if n.is_integer() else f"{n:,.2f}".rstrip("0").rstrip(".")
-    except (ValueError, TypeError):
-        return value.strip()
+def centered(draw, xy, text, font, fill):
+    x, y = xy
+    draw.text((x, y), text, font=font, fill=fill, anchor="mm")
 
 
 def parse_statement(text):
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    """
+    يقبل بيانات بالشكل التالي:
 
-    def amount_for(labels):
-        for line in lines:
-            for label in labels:
-                match = re.search(
-                    re.escape(label) + r"\s*[:=]?\s*(-?[\d,٬ ]+(?:\.\d+)?)",
-                    line, re.I
-                )
-                if match:
-                    return show_amount(match.group(1))
-        return "0"
+    Total Amount: 110000
+    Remaining Balance: 30000
+    Total Payments: 80000
+    2023/09/13 = 25000
+    2024/02/20 = 15000
+    """
 
-    total = amount_for(["Total Amount", "Grand Total", "Total"])
-    paid = amount_for(["Total Payments", "Total Payment", "Total Paid"])
-    remaining = amount_for([
-        "Remaining Balance", "Outstanding Balance",
-        "Balance Remaining", "Remaining"
-    ])
-
-    invoice_no = None
-    for line in lines:
-        match = re.search(
-            r"(?:Invoice\s*(?:No\.?|Number|#)|Reference\s*(?:No\.?|#))"
-            r"\s*[:#-]?\s*([A-Za-z0-9/_-]+)", line, re.I
-        )
-        if match:
-            invoice_no = match.group(1)
-            break
-
+    total = None
+    remaining = None
+    stated_paid = None
     payments = []
-    for line in lines:
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        normalized = line.lower().replace(",", "").strip()
+
+        amount_match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+
+        if amount_match:
+            value = float(amount_match.group())
+            if value.is_integer():
+                value = int(value)
+        else:
+            value = None
+
+        if value is not None and any(
+            key in normalized
+            for key in ["total amount", "إجمالي المبلغ", "اجمالي المبلغ"]
+        ):
+            total = value
+            continue
+
+        if value is not None and any(
+            key in normalized
+            for key in [
+                "remaining balance",
+                "remaining",
+                "المتبقي",
+                "الباقي",
+            ]
+        ):
+            remaining = value
+            continue
+
+        if value is not None and any(
+            key in normalized
+            for key in [
+                "total payments",
+                "total paid",
+                "إجمالي المدفوع",
+                "اجمالي المدفوع",
+                "المدفوع",
+            ]
+        ):
+            stated_paid = value
+            continue
+
+        # استخراج التاريخ والمبلغ من سطر الدفعة
         match = re.search(
-            r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})\s*(?:=|:|-)?\s*"
-            r"(-?[\d,٬ ]+(?:\.\d+)?)", line
+            r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})\s*(?:=|:|-|\s)\s*"
+            r"([\d,]+(?:\.\d+)?)",
+            line,
         )
+
         if match:
-            payments.append((
-                match.group(1).replace("-", "/"),
-                show_amount(match.group(2))
-            ))
+            date_text = match.group(1).replace("-", "/")
+            try:
+                date_obj = datetime.strptime(date_text, "%Y/%m/%d")
+                date_text = date_obj.strftime("%Y/%m/%d")
+            except ValueError:
+                pass
 
-    return total, paid, remaining, payments, invoice_no
+            raw_amount = match.group(2).replace(",", "")
+            amount = float(raw_amount)
+            if amount.is_integer():
+                amount = int(amount)
+
+            payments.append((date_text, amount))
+
+    if not payments and total is None and remaining is None:
+        raise ValueError(
+            "لم أجد بيانات فاتورة واضحة. أرسل إجمالي المبلغ "
+            "والباقي وسطور الدفعات بالتواريخ."
+        )
+
+    calculated_paid = sum(amount for _, amount in payments)
+    paid = stated_paid if stated_paid is not None else calculated_paid
+
+    if total is None and remaining is not None:
+        total = paid + remaining
+
+    if remaining is None and total is not None:
+        remaining = total - paid
+
+    if total is None:
+        total = paid + (remaining or 0)
+
+    if remaining is None:
+        remaining = 0
+
+    return total, paid, remaining, payments
 
 
-def centered(draw, text, y, f, color, width=W):
-    b = draw.textbbox((0, 0), text, font=f)
-    x = (width - (b[2] - b[0])) // 2
-    draw.text((x, y), text, font=f, fill=color)
+def money(value):
+    try:
+        return f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}"
+    except (ValueError, TypeError):
+        return str(value)
 
 
-def fitted_font(draw, text, max_width, size, bold=True):
-    while size > 22:
-        f = font(size, bold)
-        b = draw.textbbox((0, 0), text, font=f)
-        if b[2] - b[0] <= max_width:
-            return f
-        size -= 2
-    return font(size, bold)
+def draw_rounded(draw, box, radius, fill, outline=None, width=2):
+    draw.rounded_rectangle(
+        box,
+        radius=radius,
+        fill=fill,
+        outline=outline,
+        width=width,
+    )
 
 
 def make_invoice(text):
-    total, paid, remaining, payments, invoice_no = parse_statement(text)
-    now = datetime.now(TZ)
+    total, paid, remaining, payments = parse_statement(text)
 
-    if not invoice_no:
-        seed = text + now.strftime("%Y%m%d%H%M")
-        code = hashlib.sha1(seed.encode()).hexdigest()[:8].upper()
-        invoice_no = "AZ-" + now.strftime("%Y%m%d") + "-" + code
+    # نحدد ارتفاع الصورة حسب عدد الدفعات حتى لا تتداخل الصفوف
+    row_h = 54
+    table_header_h = 88
+    title_h = 100
+    summary_h = 190
+    meta_h = 100
+    footer_h = 115
+    gap = 26
 
-    # Every payment gets a very tall row for readability.
-    header_h = 340
-    date_h = 155
-    summary_h = 3 * 190 + 110
-    table_title_h = 115
-    table_head_h = 100
-    row_h = 125
-    footer_h = 175
-    height = (
-        header_h + date_h + summary_h + table_title_h
-        + table_head_h + max(len(payments), 1) * row_h
-        + footer_h
+    table_h = table_header_h + max(len(payments), 1) * row_h
+    H = (
+        180 + meta_h + gap + summary_h + gap
+        + title_h + table_h + footer_h + 80
     )
 
-    im = Image.new("RGB", (W, height), CREAM)
+    im = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(im)
 
-    # Premium navy and gold header
-    d.rectangle((0, 0, W, header_h), fill=NAVY)
-    d.rectangle((0, header_h - 12, W, header_h), fill=GOLD)
+    # رأس الفاتورة
+    d.rectangle((0, 0, W, 170), fill=NAVY)
+    d.rectangle((0, 158, W, 166), fill=GOLD)
 
-    centered(d, "AZIZ EGYPTIAN COMMERCE", 48, font(53, True), GOLD)
-    centered(d, "PAYMENT STATEMENT", 135, font(48, True), WHITE)
-    centered(d, "INVOICE  " + invoice_no, 230, font(31, True), GOLD)
-
-    # Issue date
-    y = header_h + 25
-    d.rounded_rectangle(
-        (M, y, W - M, y + 115), radius=22,
-        fill=WHITE, outline=GOLD, width=3
+    centered(
+        d, (W // 2, 54),
+        "AZIZ EGYPTIAN COMMERCE",
+        load_font(54, True), GOLD
     )
-    d.text((M + 30, y + 12), "ISSUE DATE", font=font(24, True), fill=GREY)
+    centered(
+        d, (W // 2, 116),
+        "PAYMENT STATEMENT",
+        load_font(42, True), WHITE
+    )
+
+    y = 190
+
+    # بيانات الفاتورة
+    draw_rounded(
+        d, (MARGIN, y, W - MARGIN, y + meta_h),
+        22, "#F1F0EC", outline="#E2DCCF", width=2
+    )
     d.text(
-        (M + 30, y + 48),
-        now.strftime("%d %B %Y   |   %I:%M %p"),
-        font=font(34, True), fill=NAVY
+        (MARGIN + 28, y + 18), "DATE & TIME",
+        font=load_font(23, True), fill=NAVY
+    )
+    d.text(
+        (MARGIN + 28, y + 53),
+        datetime.now().strftime("%d %B %Y  |  %I:%M %p"),
+        font=fit_font(d, datetime.now().strftime("%d %B %Y  |  %I:%M %p"),
+                      510, 25, True),
+        fill=TEXT
     )
 
-    # Summary cards, stacked vertically for large type
-    y += 150
-    centered(d, "ACCOUNT SUMMARY", y, font(43, True), NAVY)
-    y += 80
+    divider_x = W // 2 + 20
+    d.line(
+        (divider_x, y + 16, divider_x, y + meta_h - 16),
+        fill=GOLD, width=3
+    )
+    d.text(
+        (divider_x + 28, y + 18), "INVOICE NO.",
+        font=load_font(23, True), fill=NAVY
+    )
+    invoice_no = datetime.now().strftime("AZ-%Y%m%d-%H%M%S")
+    d.text(
+        (divider_x + 28, y + 53), invoice_no,
+        font=fit_font(d, invoice_no, W // 2 - 100, 25, True),
+        fill=TEXT
+    )
 
+    y += meta_h + gap
+
+    # بطاقات الملخص
+    card_gap = 16
+    card_w = (W - 2 * MARGIN - 2 * card_gap) // 3
     cards = [
-        ("TOTAL AMOUNT", total),
-        ("TOTAL PAYMENTS", paid),
-        ("REMAINING BALANCE", remaining),
+        ("TOTAL AMOUNT", total, NAVY),
+        ("TOTAL PAYMENTS", paid, GREEN),
+        ("REMAINING BALANCE", remaining, NAVY),
     ]
 
-    for label, amount in cards:
+    for i, (label, value, color) in enumerate(cards):
+        x1 = MARGIN + i * (card_w + card_gap)
+        x2 = x1 + card_w
+
+        draw_rounded(d, (x1, y, x2, y + summary_h), 24, color)
+        centered(
+            d, ((x1 + x2) // 2, y + 42),
+            label,
+            fit_font(d, label, card_w - 28, 25, True, 18),
+            WHITE
+        )
+
         d.rounded_rectangle(
-            (M, y, W - M, y + 170), radius=24,
-            fill=WHITE, outline=GOLD, width=3
+            (x1 + 3, y + 76, x2 - 3, y + summary_h - 3),
+            radius=20, fill=BG
+        )
+        centered(
+            d, ((x1 + x2) // 2, y + 132),
+            money(value),
+            fit_font(d, money(value), card_w - 26, 46, True, 22),
+            GREEN if i == 1 else NAVY
         )
         d.rounded_rectangle(
-            (M, y, M + 15, y + 170), radius=6, fill=GOLD
+            (x1 + 2, y, x2 - 2, y + summary_h),
+            radius=24, outline=color, width=3
         )
-        d.text((M + 34, y + 17), label, font=font(29, True), fill=GREY)
 
-        af = fitted_font(d, amount, W - 2 * M - 90, 58, True)
-        d.text((M + 34, y + 66), amount, font=af, fill=NAVY)
-        y += 190
+    y += summary_h + gap
 
-    # Payment history
-    y += 5
-    centered(d, "PAYMENT HISTORY", y, font(43, True), NAVY)
-    y += 75
-
+    # عنوان جدول الدفعات
     d.rounded_rectangle(
-        (M, y, W - M, y + table_head_h), radius=16, fill=NAVY
+        (MARGIN, y, W - MARGIN, y + title_h),
+        radius=22, fill=NAVY
     )
-    d.text((M + 28, y + 24), "DATE", font=font(30, True), fill=GOLD)
-    amount_head = "AMOUNT"
-    hb = d.textbbox((0, 0), amount_head, font=font(30, True))
     d.text(
-        (W - M - 28 - (hb[2] - hb[0]), y + 24),
-        amount_head, font=font(30, True), fill=GOLD
+        (MARGIN + 32, y + 22), "PAYMENT DETAILS",
+        font=load_font(39, True), fill=WHITE
     )
-    y += table_head_h
+    d.line(
+        (MARGIN + 24, y + title_h - 4, W - MARGIN - 24, y + title_h - 4),
+        fill=GOLD, width=4
+    )
+
+    y += title_h - 1
+    table_top = y
+    table_bottom = table_top + table_h
+
+    # خلفية الجدول
+    d.rectangle(
+        (MARGIN, table_top, W - MARGIN, table_bottom),
+        fill=WHITE
+    )
+    d.rectangle(
+        (MARGIN, table_top, W - MARGIN, table_top + table_header_h),
+        fill=NAVY_LIGHT
+    )
+
+    left_col = MARGIN + 30
+    mid_col = W // 2
+    right_col = W - MARGIN - 30
+
+    centered(
+        d, ((left_col + mid_col) // 2, table_top + table_header_h // 2),
+        "DATE", load_font(32, True), WHITE
+    )
+    centered(
+        d, ((mid_col + right_col) // 2, table_top + table_header_h // 2),
+        "AMOUNT", load_font(32, True), WHITE
+    )
+
+    d.line(
+        (mid_col, table_top, mid_col, table_bottom),
+        fill="#B7D5F0", width=2
+    )
 
     if not payments:
-        d.rectangle((M, y, W - M, y + row_h), fill=WHITE)
-        d.text((M + 28, y + 38), "No payment entries found",
-               font=font(28), fill=GREY)
-        y += row_h
+        centered(
+            d, (W // 2, table_top + table_header_h + row_h // 2),
+            "NO PAYMENT DETAILS",
+            load_font(24, True), TEXT
+        )
     else:
-        for i, (date, amount) in enumerate(payments):
-            d.rectangle(
-                (M, y, W - M, y + row_h),
-                fill=WHITE if i % 2 == 0 else PALE
-            )
+        for i, (date_text, amount) in enumerate(payments):
+            row_y = table_top + table_header_h + i * row_h
+            row_end = row_y + row_h
 
-            d.text((M + 28, y + 38), date, font=font(32, True), fill=INK)
+            if i % 2 == 0:
+                d.rectangle(
+                    (MARGIN, row_y, W - MARGIN, row_end),
+                    fill="#F7FBFF"
+                )
+            else:
+                d.rectangle(
+                    (MARGIN, row_y, W - MARGIN, row_end),
+                    fill=BLUE_PALE
+                )
 
-            af = fitted_font(d, amount, 400, 35, True)
-            ab = d.textbbox((0, 0), amount, font=af)
             d.text(
-                (W - M - 28 - (ab[2] - ab[0]), y + 35),
-                amount, font=af, fill=NAVY
+                (left_col + 12, row_y + row_h // 2),
+                date_text,
+                font=fit_font(d, date_text, mid_col - left_col - 28, 29, True),
+                fill=TEXT,
+                anchor="lm"
+            )
+            d.text(
+                (right_col - 12, row_y + row_h // 2),
+                money(amount),
+                font=fit_font(d, money(amount), right_col - mid_col - 28, 30, True),
+                fill=TEXT,
+                anchor="rm"
             )
 
-            d.line((M, y + row_h, W - M, y + row_h), fill=GOLD, width=2)
-            y += row_h
+            d.line(
+                (MARGIN, row_end, W - MARGIN, row_end),
+                fill="#D9E8F5", width=1
+            )
 
-    # Footer
-    y += 35
-    d.line((M, y, W - M, y), fill=GOLD, width=4)
-    centered(d, "THANK YOU FOR YOUR BUSINESS", y + 30,
-             font(28, True), NAVY)
-    centered(d, "AZIZ EGYPTIAN COMMERCE", y + 80,
-             font(22, True), GREY)
+    # إطار الجدول
+    d.rounded_rectangle(
+        (MARGIN, table_top, W - MARGIN, table_bottom),
+        radius=22, outline=BORDER, width=3
+    )
 
-    out = BytesIO()
-    im.save(out, format="PNG", dpi=(150, 150), optimize=True)
-    out.seek(0)
-    out.name = "aziz_invoice.png"
-    return out
+    # التذييل
+    footer_y = table_bottom + 35
+    centered(
+        d, (W // 2, footer_y + 15),
+        "THANK YOU FOR YOUR BUSINESS",
+        load_font(25, True), NAVY
+    )
+    d.line(
+        (MARGIN + 30, footer_y + 15, W // 2 - 250, footer_y + 15),
+        fill=GOLD, width=3
+    )
+    d.line(
+        (W // 2 + 250, footer_y + 15, W - MARGIN - 30, footer_y + 15),
+        fill=GOLD, width=3
+    )
+    centered(
+        d, (W // 2, footer_y + 55),
+        "AZIZ EGYPTIAN COMMERCE",
+        load_font(20), NAVY
+    )
+
+    # شريط سفلي كحلي وذهبي
+    d.rectangle((0, H - 20, W, H), fill=NAVY)
+    d.rectangle((0, H - 20, W, H - 14), fill=GOLD)
+
+    output = BytesIO()
+    im.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Welcome to Aziz Egyptian Commerce!\n\n"
-        "Send your statement in English.\n\n"
-        "Example:\n"
-        "Invoice No: 12345\n"
+        "أهلاً بك في AZIZ EGYPTIAN COMMERCE.\n\n"
+        "أرسل بيانات الفاتورة في رسالة واحدة بهذا الشكل:\n\n"
         "Total Amount: 110000\n"
         "Remaining Balance: 30000\n"
         "Total Payments: 80000\n"
         "2023/09/13 = 25000\n"
         "2024/02/20 = 15000\n"
         "2024/07/05 = 30000\n"
-        "2024/08/14 = 10000"
+        "2024/08/14 = 10000\n\n"
+        "سأحوّل البيانات إلى صورة فاتورة."
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_statement(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     if not update.message or not update.message.text:
         return
 
     try:
-        image = make_invoice(update.message.text)
+        image_file = make_invoice(update.message.text)
         await update.message.reply_photo(
-            photo=image,
-            caption="Your invoice is ready."
+            photo=image_file,
+            caption="AZIZ EGYPTIAN COMMERCE — PAYMENT STATEMENT"
         )
-    except Exception:
-        log.exception("Invoice creation failed")
+    except Exception as exc:
+        print("Invoice error:", repr(exc))
         await update.message.reply_text(
-            "Could not create the invoice. Please check the statement format."
+            "لم أستطع إنشاء الفاتورة من البيانات المرسلة.\n"
+            "تأكد من وجود إجمالي المبلغ أو الباقي، "
+            "وأن كل دفعة مكتوبة بالتاريخ والمبلغ."
         )
-
-
-async def error_handler(update, context):
-    log.error("Telegram error", exc_info=context.error)
 
 
 def main():
     if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
+        raise RuntimeError(
+            "متغير البيئة TELEGRAM_BOT_TOKEN غير موجود. "
+            "أضف التوكن في إعدادات Environment Variables."
+        )
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_statement)
     )
-    app.add_error_handler(error_handler)
 
-    log.info("Telegram invoice bot is starting.")
-    app.run_polling(drop_pending_updates=False)
+    print("Invoice bot is running...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
