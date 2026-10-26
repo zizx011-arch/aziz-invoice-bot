@@ -1,28 +1,32 @@
 
 import os
 import re
-import io
+import logging
+from io import BytesIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TIMEZONE = ZoneInfo("Africa/Lusaka")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TZ = ZoneInfo("Africa/Lusaka")
 
-NAVY = "#17365D"
-BLUE = "#2463A6"
-LIGHT = "#F2F6FC"
-GOLD = "#D5A64A"
-GREEN = "#21865B"
-DARK = "#243247"
-GRAY = "#64748B"
-WHITE = "#FFFFFF"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger(__name__)
 
 
-def font(size, bold=False):
+def get_font(size, bold=False):
     paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
         if bold else
@@ -38,274 +42,184 @@ def font(size, bold=False):
 
 
 def money(value):
-    return f"{value:,.0f}"
+    return value.replace(",", "").replace("٬", "").strip()
 
 
 def parse_invoice(text):
-    total = re.search(
-        r"Total Amount\s*:\s*([\d,]+(?:\.\d+)?)", text, re.I
-    )
-    remaining = re.search(
-        r"Remaining Balance\s*:\s*([\d,]+(?:\.\d+)?)", text, re.I
-    )
-    payments_total = re.search(
-        r"Total Payments\s*:\s*([\d,]+(?:\.\d+)?)", text, re.I
-    )
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    if not (total and remaining and payments_total):
-        raise ValueError(
-            "Please include Total Amount, Remaining Balance, "
-            "and Total Payments."
-        )
+    def find_amount(label):
+        for line in lines:
+            if label.lower() in line.lower():
+                match = re.search(r"(-?[\d,٬]+(?:\.\d+)?)", line)
+                if match:
+                    return money(match.group(1))
+        return "0"
 
-    def number(match):
-        return float(match.group(1).replace(",", ""))
+    total = find_amount("Total Amount")
+    remaining = find_amount("Remaining Balance")
+    payments_total = find_amount("Total Payments")
 
-    rows = []
-    for line in text.splitlines():
-        match = re.match(
-            r"\s*\|?\s*(\d{4}/\d{2}/\d{2})\s*\|\s*"
-            r"([\d,]+(?:\.\d+)?)\s*\|?\s*$",
+    payments = []
+    for line in lines:
+        match = re.search(
+            r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})\s*(?:=|:|-)?\s*"
+            r"(-?[\d,٬]+(?:\.\d+)?)",
             line,
         )
         if match:
-            date = datetime.strptime(match.group(1), "%Y/%m/%d")
-            amount = float(match.group(2).replace(",", ""))
-            rows.append((date, amount))
+            date = match.group(1).replace("-", "/")
+            amount = money(match.group(2))
+            if date not in ("0000/00/00",):
+                payments.append((date, amount))
 
-    if not rows:
-        raise ValueError("No payment rows found. Please check the table.")
-
-    return number(total), number(remaining), number(payments_total), rows
+    return total, remaining, payments_total, payments
 
 
-def make_invoice(total, remaining, payments_total, rows):
-    width = 1000
-    margin = 55
+def create_invoice(text):
+    total, remaining, payments_total, payments = parse_invoice(text)
+
+    width = 1100
+    margin = 65
     row_height = 48
-    table_top = 440
-    footer_height = 100
-    height = table_top + 58 + len(rows) * row_height + footer_height
+    height = 440 + max(len(payments), 1) * row_height + 80
 
-    image = Image.new("RGB", (width, height), WHITE)
+    image = Image.new("RGB", (width, height), "#F4F6FA")
     draw = ImageDraw.Draw(image)
 
-    # Header
-    draw.rounded_rectangle(
-        (margin, 35, width - margin, 175),
-        radius=24,
-        fill=NAVY,
-    )
-    draw.text(
-        (width // 2, 78),
-        "Aziz Egyptian commerce",
-        font=font(37, True),
-        fill=WHITE,
-        anchor="mm",
-    )
-    draw.rounded_rectangle(
-        (width // 2 - 100, 122, width // 2 + 100, 128),
-        radius=3,
-        fill=GOLD,
-    )
-    draw.text(
-        (width // 2, 151),
-        "CUSTOMER ACCOUNT STATEMENT",
-        font=font(17, True),
-        fill="#E7EDF7",
-        anchor="mm",
-    )
+    title_font = get_font(38, True)
+    heading_font = get_font(25, True)
+    body_font = get_font(22)
+    small_font = get_font(17)
 
-    now = datetime.now(TIMEZONE)
-    draw.text(
-        (width // 2, 208),
-        "ISSUE DATE & TIME",
-        font=font(17, True),
-        fill=GRAY,
-        anchor="mm",
-    )
-    draw.text(
-        (width // 2, 240),
-        now.strftime("%Y/%m/%d   %H:%M"),
-        font=font(25, True),
-        fill=DARK,
-        anchor="mm",
-    )
+    # Header
+    draw.rectangle((0, 0, width, 150), fill="#172B4D")
+    draw.text((margin, 30), "AZIZ EGYPTIAN COMMERCE",
+              font=title_font, fill="white")
+    draw.text((margin, 92), "PAYMENT STATEMENT",
+              font=body_font, fill="#DCE6F5")
+
+    now = datetime.now(TZ).strftime("%d %b %Y  |  %I:%M %p")
+    draw.text((margin, 175), f"Issue date: {now}",
+              font=small_font, fill="#526078")
 
     # Summary cards
-    card_top, card_bottom = 285, 405
-    gap = 15
-    card_width = (width - 2 * margin - 2 * gap) // 3
     cards = [
-        ("TOTAL AMOUNT", total, NAVY),
-        ("TOTAL PAYMENTS", payments_total, GREEN),
-        ("REMAINING BALANCE", remaining, BLUE),
+        ("TOTAL AMOUNT", total),
+        ("TOTAL PAYMENTS", payments_total),
+        ("REMAINING BALANCE", remaining),
     ]
+    card_y = 220
+    gap = 18
+    card_w = (width - 2 * margin - 2 * gap) // 3
 
-    for i, (label, amount, color) in enumerate(cards):
-        x1 = margin + i * (card_width + gap)
-        x2 = x1 + card_width
+    for i, (label, value) in enumerate(cards):
+        x = margin + i * (card_w + gap)
         draw.rounded_rectangle(
-            (x1, card_top, x2, card_bottom),
-            radius=16,
-            fill=LIGHT,
-            outline="#DCE5F0",
-            width=2,
+            (x, card_y, x + card_w, card_y + 115),
+            radius=15, fill="white", outline="#E0E5ED", width=2
         )
-        draw.rounded_rectangle(
-            (x1, card_top, x2, card_top + 8),
-            radius=4,
-            fill=color,
-        )
-        draw.text(
-            ((x1 + x2) // 2, card_top + 38),
-            label,
-            font=font(14, True),
-            fill=GRAY,
-            anchor="mm",
-        )
-        draw.text(
-            ((x1 + x2) // 2, card_top + 78),
-            money(amount),
-            font=font(25, True),
-            fill=color,
-            anchor="mm",
-        )
+        draw.text((x + 18, card_y + 18), label,
+                  font=small_font, fill="#526078")
+        draw.text((x + 18, card_y + 55), value,
+                  font=heading_font, fill="#172B4D")
 
     # Payment history
+    table_y = 375
+    draw.text((margin, table_y), "PAYMENT HISTORY",
+              font=heading_font, fill="#172B4D")
+
+    table_y += 48
     draw.rounded_rectangle(
-        (margin, table_top, width - margin, table_top + 48),
-        radius=10,
-        fill=NAVY,
+        (margin, table_y, width - margin, table_y + 46),
+        radius=7, fill="#DCE6F5"
     )
-    draw.text(
-        (margin + 22, table_top + 24),
-        "PAYMENT HISTORY",
-        font=font(20, True),
-        fill=WHITE,
-        anchor="lm",
-    )
+    draw.text((margin + 18, table_y + 10), "DATE",
+              font=body_font, fill="#172B4D")
+    draw.text((width - margin - 250, table_y + 10), "AMOUNT",
+              font=body_font, fill="#172B4D")
 
-    header_y = table_top + 58
-    draw.rectangle(
-        (margin, header_y, width - margin, header_y + 43),
-        fill="#E5EDF7",
-    )
-    draw.text(
-        (margin + 25, header_y + 21),
-        "NO.",
-        font=font(15, True),
-        fill=NAVY,
-        anchor="lm",
-    )
-    draw.text(
-        (margin + 110, header_y + 21),
-        "DATE",
-        font=font(15, True),
-        fill=NAVY,
-        anchor="lm",
-    )
-    draw.text(
-        (width - margin - 25, header_y + 21),
-        "AMOUNT",
-        font=font(15, True),
-        fill=NAVY,
-        anchor="rm",
-    )
+    table_y += 46
 
-    y = header_y + 43
-    for index, (date, amount) in enumerate(rows, 1):
-        bg = WHITE if index % 2 == 0 else LIGHT
-        draw.rectangle(
-            (margin, y, width - margin, y + row_height),
-            fill=bg,
-        )
-        draw.text(
-            (margin + 25, y + row_height // 2),
-            str(index),
-            font=font(16),
-            fill=GRAY,
-            anchor="lm",
-        )
-        draw.text(
-            (margin + 110, y + row_height // 2),
-            date.strftime("%Y/%m/%d"),
-            font=font(17),
-            fill=DARK,
-            anchor="lm",
-        )
-        draw.text(
-            (width - margin - 25, y + row_height // 2),
-            money(amount),
-            font=font(17, True),
-            fill=DARK,
-            anchor="rm",
-        )
-        draw.line(
-            (margin, y + row_height, width - margin, y + row_height),
-            fill="#DFE6EF",
-            width=1,
-        )
-        y += row_height
+    if not payments:
+        draw.text((margin + 18, table_y + 14),
+                  "No payment entries found",
+                  font=body_font, fill="#526078")
+    else:
+        for i, (date, amount) in enumerate(payments):
+            y = table_y + i * row_height
+            fill = "white" if i % 2 == 0 else "#EEF1F6"
+            draw.rectangle(
+                (margin, y, width - margin, y + row_height),
+                fill=fill
+            )
+            draw.text((margin + 18, y + 10), date,
+                      font=body_font, fill="#26364D")
+            draw.text((width - margin - 250, y + 10), amount,
+                      font=body_font, fill="#26364D")
 
-    # Footer
-    footer_y = y + 25
-    draw.rounded_rectangle(
-        (margin, footer_y, width - margin, footer_y + 65),
-        radius=12,
-        fill="#F7F0E2",
-    )
-    draw.text(
-        (width // 2, footer_y + 32),
-        f"TOTAL PAYMENTS: {money(payments_total)}",
-        font=font(20, True),
-        fill=NAVY,
-        anchor="mm",
-    )
+    footer_y = height - 55
+    draw.text((margin, footer_y),
+              "Thank you for your business.",
+              font=small_font, fill="#526078")
 
-    output = io.BytesIO()
+    output = BytesIO()
     image.save(output, format="PNG")
     output.seek(0)
     return output
 
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Welcome!\n\n"
+        "Send me your payment statement as text, and I will "
+        "turn it into an English invoice image (PNG).\n\n"
+        "Include these labels:\n"
+        "Total Amount: 360000\n"
+        "Remaining Balance: 0\n"
+        "Total Payments: 360000\n\n"
+        "Payment rows: 2023/05/19 = 10000"
+    )
+
+
 async def handle_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    message = update.effective_message
-    if not message or not message.text:
+    if not update.message or not update.message.text:
         return
 
     try:
-        total, remaining, paid, rows = parse_invoice(message.text)
-        picture = make_invoice(total, remaining, paid, rows)
-
-        await message.reply_photo(
-            photo=picture,
-            caption="Aziz Egyptian commerce | Invoice generated",
+        image = create_invoice(update.message.text)
+        await update.message.reply_photo(
+            photo=image,
+            caption="Your payment statement is ready."
+        )
+    except Exception:
+        log.exception("Invoice generation failed")
+        await update.message.reply_text(
+            "I couldn't create the invoice. Please check the text format."
         )
 
-        sum_rows = sum(amount for _, amount in rows)
-        if abs(sum_rows - paid) > 0.01:
-            await message.reply_text(
-                f"Warning: Payment rows total {money(sum_rows)}, "
-                f"but Total Payments says {money(paid)}."
-            )
 
-    except Exception as error:
-        await message.reply_text(
-            "I couldn't format this invoice.\n"
-            f"Details: {error}"
-        )
+async def error_handler(update, context):
+    log.exception("Telegram bot error", exc_info=context.error)
 
 
 def main():
+    if not TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN environment variable is missing."
+        )
+
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-    print("Invoice bot is running.")
-    app.run_polling()
+    app.add_error_handler(error_handler)
+
+    log.info("Telegram invoice bot is starting.")
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
